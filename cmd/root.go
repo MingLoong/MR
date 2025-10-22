@@ -1,7 +1,12 @@
 package cmd
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/signal"
 	"path"
@@ -20,7 +25,11 @@ import (
 )
 
 var (
-	cfgFile string
+	cfgFile   string
+	keyStr    string
+	encrypt   bool
+	encOutput string
+
 	rootCmd = &cobra.Command{
 		Use: "XrayR",
 		Run: func(cmd *cobra.Command, args []string) {
@@ -33,41 +42,112 @@ var (
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Config file for XrayR.")
+	rootCmd.PersistentFlags().StringVarP(&keyStr, "key", "k", "", "Key for encryption/decryption.")
+	rootCmd.PersistentFlags().BoolVarP(&encrypt, "encrypt", "e", false, "Encrypt the config instead of running server.")
+	rootCmd.PersistentFlags().StringVarP(&encOutput, "enc-output", "o", "", "Output file for encrypted config.")
+}
+
+// encryptAES256CFBWithHash 将文件内容使用 key 生成 SHA256 再 AES-256-CFB 加密
+func encryptAES256CFBWithHash(inputFile, key, outputFile string) error {
+	data, err := ioutil.ReadFile(inputFile)
+	if err != nil {
+		return err
+	}
+
+	hashKey := sha256.Sum256([]byte(key))
+	iv := bytes.Repeat([]byte{0}, aes.BlockSize)
+	block, err := aes.NewCipher(hashKey[:])
+	if err != nil {
+		return err
+	}
+
+	encrypted := make([]byte, len(data))
+	stream := cipher.NewCFBEncrypter(block, iv)
+	stream.XORKeyStream(encrypted, data)
+
+	if outputFile == "" {
+		outputFile = inputFile + ".enc"
+	}
+
+	return ioutil.WriteFile(outputFile, encrypted, 0644)
+}
+
+// decryptAES256CFBWithHash 使用 SHA256(key) 生成 32 字节 AES-256 key 解密配置
+func decryptAES256CFBWithHash(cipherFile string, key string) ([]byte, error) {
+	data, err := ioutil.ReadFile(cipherFile)
+	if err != nil {
+		return nil, err
+	}
+
+	hashKey := sha256.Sum256([]byte(key))
+	iv := bytes.Repeat([]byte{0}, aes.BlockSize)
+	block, err := aes.NewCipher(hashKey[:])
+	if err != nil {
+		return nil, err
+	}
+
+	decrypted := make([]byte, len(data))
+	stream := cipher.NewCFBDecrypter(block, iv)
+	stream.XORKeyStream(decrypted, data)
+
+	return decrypted, nil
 }
 
 func getConfig() *viper.Viper {
 	config := viper.New()
 
-	// Set custom path and name
-	if cfgFile != "" {
-		configName := path.Base(cfgFile)
-		configFileExt := path.Ext(cfgFile)
-		configNameOnly := strings.TrimSuffix(configName, configFileExt)
-		configPath := path.Dir(cfgFile)
-		config.SetConfigName(configNameOnly)
-		config.SetConfigType(strings.TrimPrefix(configFileExt, "."))
-		config.AddConfigPath(configPath)
-		// Set ASSET Path and Config Path for XrayR
-		os.Setenv("XRAY_LOCATION_ASSET", configPath)
-		os.Setenv("XRAY_LOCATION_CONFIG", configPath)
+	if keyStr != "" && !encrypt {
+		if cfgFile == "" {
+			log.Panicf("Must specify encrypted config file with --config")
+		}
+		plainData, err := decryptAES256CFBWithHash(cfgFile, keyStr)
+		if err != nil {
+			log.Panicf("Failed to decrypt config: %s", err)
+		}
+
+		config.SetConfigType("yaml")
+		if err := config.ReadConfig(bytes.NewReader(plainData)); err != nil {
+			log.Panicf("Failed to read decrypted config: %s", err)
+		}
 	} else {
-		// Set default config path
-		config.SetConfigName("config")
-		config.SetConfigType("yml")
-		config.AddConfigPath(".")
+		if cfgFile != "" {
+			configName := path.Base(cfgFile)
+			configFileExt := path.Ext(cfgFile)
+			configNameOnly := strings.TrimSuffix(configName, configFileExt)
+			configPath := path.Dir(cfgFile)
+			config.SetConfigName(configNameOnly)
+			config.SetConfigType(strings.TrimPrefix(configFileExt, "."))
+			config.AddConfigPath(configPath)
+			os.Setenv("XRAY_LOCATION_ASSET", configPath)
+			os.Setenv("XRAY_LOCATION_CONFIG", configPath)
+		} else {
+			config.SetConfigName("config")
+			config.SetConfigType("yml")
+			config.AddConfigPath(".")
+		}
 
+		if err := config.ReadInConfig(); err != nil {
+			log.Panicf("Config file error: %s \n", err)
+		}
 	}
 
-	if err := config.ReadInConfig(); err != nil {
-		log.Panicf("Config file error: %s \n", err)
-	}
-
-	config.WatchConfig() // Watch the config
-
+	config.WatchConfig()
 	return config
 }
 
 func run() error {
+	if encrypt {
+		if cfgFile == "" || keyStr == "" {
+			log.Panicf("Must specify --config and --key when encrypting")
+		}
+		err := encryptAES256CFBWithHash(cfgFile, keyStr, encOutput)
+		if err != nil {
+			log.Panicf("Failed to encrypt config: %s", err)
+		}
+		fmt.Printf("Config encrypted successfully to %s\n", encOutput)
+		return nil
+	}
+
 	showVersion()
 
 	config := getConfig()
@@ -83,21 +163,16 @@ func run() error {
 	p := panel.New(panelConfig)
 	lastTime := time.Now()
 	config.OnConfigChange(func(e fsnotify.Event) {
-		// Discarding event received within a short period of time after receiving an event.
 		if time.Now().After(lastTime.Add(3 * time.Second)) {
-			// Hot reload function
 			fmt.Println("Config file changed:", e.Name)
 			p.Close()
-			// Delete old instance and trigger GC
 			runtime.GC()
 			if err := config.Unmarshal(panelConfig); err != nil {
 				log.Panicf("Parse config file %v failed: %s \n", cfgFile, err)
 			}
-
 			if panelConfig.LogConfig.Level == "debug" {
 				log.SetReportCaller(true)
 			}
-
 			p.Start()
 			lastTime = time.Now()
 		}
@@ -106,9 +181,6 @@ func run() error {
 	p.Start()
 	defer p.Close()
 
-	// Explicitly triggering GC to remove garbage from config loading.
-	runtime.GC()
-	// Running backend
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, os.Kill, syscall.SIGTERM)
 	<-osSignals
